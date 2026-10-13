@@ -1,0 +1,131 @@
+name: Fresh Sync
+
+# Builds every new official Prism Launcher release with the Fresh theme applied.
+#
+# Once a day (or on demand) it looks for the latest stable upstream tag (X.Y.Z). If this fork has no
+# X.Y.Z-fresh tag yet, it creates the branch fresh/X.Y.Z from the upstream tag and cherry-picks the Fresh
+# commits onto it (everything on feat/fresh-theme since it branched off upstream develop).
+#   - Applies cleanly: pushes fresh/X.Y.Z and the X.Y.Z-fresh tag; the tag push runs release.yml, which
+#     builds every platform and publishes the release.
+#   - Conflicts: publishes nothing and opens an issue so the conflict can be resolved by hand.
+#
+# Requirements:
+#   - feat/fresh-theme is the default branch of the fork (scheduled workflows only run there).
+#   - Secret FRESH_SYNC_TOKEN: fine-grained personal access token for this repository with
+#     Contents and Workflows read/write. Pushes made with GITHUB_TOKEN don't trigger other workflows,
+#     and GITHUB_TOKEN can't push commits that touch workflow files.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to build (empty = latest stable release)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: fresh-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync with upstream release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Fresh
+        uses: actions/checkout@v7
+        with:
+          ref: feat/fresh-theme
+          fetch-depth: 0
+          token: ${{ secrets.FRESH_SYNC_TOKEN }}
+
+      - name: Find upstream release
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          git remote add upstream https://github.com/PrismLauncher/PrismLauncher.git
+          git fetch --quiet --tags upstream develop
+
+          # stable releases only (X.Y.Z, no -pre, no -fresh)
+          tag="${REQUESTED_TAG:-$(git tag --list --sort=-version:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)}"
+          if [ -z "$tag" ] || ! git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "::error::Upstream tag '$tag' not found"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag-fresh" >/dev/null; then
+            echo "$tag-fresh already exists, nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply Fresh onto the release
+        id: apply
+        if: steps.release.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # the Fresh commits: everything on feat/fresh-theme since it branched off upstream develop
+          fresh_head=$(git rev-parse HEAD)
+          fresh_base=$(git merge-base "$fresh_head" upstream/develop)
+          echo "Applying $(git rev-list --count "$fresh_base..$fresh_head") commits onto $TAG"
+
+          git switch --create "fresh/$TAG" "refs/tags/$TAG"
+          if git cherry-pick -x "$fresh_base..$fresh_head"; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+          else
+            git status --short > conflicts.txt
+            git cherry-pick --abort
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish branch and tag
+        if: steps.apply.outputs.applied == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git push origin "fresh/$TAG"
+          git tag "$TAG-fresh"
+          # pushed with FRESH_SYNC_TOKEN, so it triggers release.yml (build + release)
+          git push origin "refs/tags/$TAG-fresh"
+          echo "Pushed $TAG-fresh, release.yml takes it from here" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report conflicts
+        if: steps.apply.outputs.applied == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          title="Fresh sync: conflicts applying Fresh onto $TAG"
+          if [ -n "$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number')" ]; then
+            echo "Issue already open"
+          else
+            {
+              echo "Cherry-picking the Fresh commits onto upstream \`$TAG\` hit conflicts, so no release was built."
+              echo
+              echo "Files reported by \`git status\` when it stopped:"
+              echo
+              echo '```'
+              cat conflicts.txt
+              echo '```'
+              echo
+              echo "To fix by hand: create \`fresh/$TAG\` from the \`$TAG\` tag, cherry-pick the Fresh commits, resolve,"
+              echo "push the branch and push the tag \`$TAG-fresh\` to start the release build."
+            } > body.md
+            gh issue create --title "$title" --body-file body.md
+          fi
+          echo "::error::Conflicts applying Fresh onto $TAG, see the issue"
+          exit 1
